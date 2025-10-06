@@ -1,0 +1,1825 @@
+---
+title: "SIL Project"
+author: "Victoria Grosu"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE, include=FALSE}
+library(MASS)
+library(boot)
+library(caret)
+library(ggplot2)
+library(readr)
+library(glmnet)
+library(effects)
+library(summarytools)
+library(glmnetUtils)
+library(pROC)
+library(ROCR)
+library(car)
+library(dplyr)
+library(corrplot)
+library(fastDummies)
+library(ggbiplot)
+library(ggplot2)
+library(hexbin)
+library(ggrepel)
+library(factoextra)
+library(DescTools)
+library(gridExtra)
+library(e1071)
+if (!require(class)) install.packages("class", dependencies = TRUE)
+library(mgcv)
+
+source("methods.r")
+set.seed(123)
+
+```
+
+# Dataset
+The dataset used in this project originates from the Adult Interview section of the 2023 National Health Interview Survey (NHIS). These surveys are conducted to collect comprehensive health-related data on the U.S. population.
+(\url{https://www.cdc.gov/nchs/nhis/documentation/2023-nhis.html})
+
+This particular component focuses on collecting detailed information from one randomly selected adult per participating household. The topics span a wide array of domains, including physical and mental health, chronic conditions, access to healthcare, and health-related behaviors.
+
+The dataset is substantial, comprising 29,522 rows and 647 columns. Each row corresponds to an individual respondent, while the columns represent responses to various survey items. Owing to the survey's design, many columns are conditionally populated. For instance, respondents who report a diabetes diagnosis are subsequently queried about insulin usage and age at diagnosis. This conditional logic results in numerous columns being sparsely populated, as not all questions apply universally.
+
+
+```{r}
+data <- read.csv("adult23.csv", stringsAsFactors = FALSE)
+
+data[] <- lapply(data, function(col) factor(as.character(col)))
+
+
+dataset_dimensions <- dim(data)
+num_rows <- dataset_dimensions[1]
+num_cols <- dataset_dimensions[2]
+
+na_counts <- colSums(is.na(data))
+num_columns_with_na <- sum(na_counts > 0)
+num_columns_complete <- sum(na_counts == 0)
+
+
+cat("The dataset contains", num_rows, "rows and", num_cols, "columns.\n")
+cat(num_columns_with_na, "columns contain at least one missing value,\n")
+cat("while", num_columns_complete, "columns are fully populated.\n")
+```
+
+```{r}
+mean_na_proportion <- mean(na_counts / num_rows)
+cat("On average,", round(mean_na_proportion * 100, 2), "% of entries per column are missing.\n")
+```
+
+
+## Preliminary Dataset Analysis
+
+The dataset `adult23.csv` contains **29,522 rows** and **647 columns**.
+
+To evaluate data quality, we analyzed the presence of missing values:
+
+- **440 columns** (≈ 68%) contain at least one missing value.  
+- **207 columns** (≈ 32%) are fully populated with no missing values.  
+- On average, **52.06% of the entries per column are missing**, highlighting a substantial amount of incomplete data.
+
+This degree of missingness suggests the need for a proper handling strategy prior to any modeling or deeper exploration. **Imputation**, **column filtering**, or **dimensionality reduction** techniques should be considered.
+
+
+
+## Variable Filtering Based on Semantic and Structural Criteria
+
+Several variables in the dataset were removed to enhance predictive performance and reduce noise. The filtering was based on three main principles:
+
+### 1. Technical or Documentation-Only Fields
+
+These include identifiers and metadata fields that do not convey predictive information:
+
+- `RECTYPE`, `SRVY_YR`, `HHX`, `WTFA_A` (Identifiers)  
+- `PSTRAT`, `PPSU` (Survey design variables)  
+- `HHRESPSA_FLG`, `ASTATNEW`, `HHSTAT_A`, `AVAIL_A` (Administrative or respondent status fields)
+
+### 2. Low-Information Columns
+
+Variables were removed if:
+
+- All values are identical (constant).  
+- All values are unique (typically IDs or free-text inputs).
+
+### 3. Survey Skip Patterns
+
+The dataset follows a conditional survey logic, where follow-up questions are asked only if the previous answer was "Yes".  
+Such patterns introduce **structured missingness**.
+
+Only variables with **meaningful variability** and **potential predictive power** were retained.
+
+
+```{r}
+cols_to_remove <- c("RECTYPE", "SRVY_YR", "HHX", "WTFA_A", "PSTRAT", "PPSU",
+                    "HHRESPSA_FLG", "ASTATNEW", "HHSTAT_A", "AVAIL_A")
+
+unique_or_all_diff <- sapply(data, function(col) {
+  n_unique <- length(unique(col))
+  n_total <- length(col)
+  return(n_unique == 1 || n_unique == n_total)
+})
+
+cols_low_info <- names(unique_or_all_diff[unique_or_all_diff])
+
+all_cols_to_remove <- unique(c(cols_to_remove, cols_low_info))
+all_cols_to_remove <- all_cols_to_remove[all_cols_to_remove %in% names(data)]
+
+data <- data[, !(names(data) %in% all_cols_to_remove)]
+
+cat("Removed columns:\n")
+print(all_cols_to_remove)
+cat("\nTotal columns removed:", length(all_cols_to_remove), "\n")
+cat("Total remaining columns:", ncol(data), "\n")
+```
+
+
+## Analysis of Numerical Variables with Missing Values
+
+To better understand missing data patterns in numerical features, we cross-referenced the variable list from `column_analysis.csv` with the actual dataset `data`.
+
+The table below shows each numerical column and its corresponding number of missing entries:
+
+```{r}
+column_analysis <- read.csv("column_analysis.csv")
+head(column_analysis)
+```
+
+```{r}
+numerical_columns <- column_analysis[column_analysis$Column.Type == "Numerical", ]
+numerical_columns_in_data <- numerical_columns[numerical_columns$Column.Name %in% names(data), ]
+numerical_columns_sorted <- numerical_columns_in_data[order(-numerical_columns_in_data$Null.Count), ]
+print(numerical_columns_sorted[, c("Column.Name", "Null.Count")])
+```
+
+
+## Filtering Valid Age Range (`AGEP_A`)
+
+The variable `AGEP_A` represents the age of the sampled adult (SA), top-coded for public use.  
+According to the NHIS documentation, this variable uses specific codes for non-informative responses:
+
+- `85`: 85+ years (valid age, but top-coded)  
+- `97`: Refused  
+- `98`: Not Ascertained  
+- `99`: Don't Know  
+
+To retain only the responses representing **actual ages**, we filtered the dataset to include only values between **18 and 84** (inclusive).
+
+This allows us to avoid mixing genuine observations with placeholders that do not correspond to real, interpretable values.  
+The filtering enhances **data integrity** and prevents **misleading interpretations** during analysis.
+
+
+```{r}
+data$AGEP_A <- as.numeric(as.character(data$AGEP_A))
+data <- subset(data, AGEP_A >= 18 & AGEP_A <= 84)
+
+summary(data$AGEP_A)
+```
+
+### Age Distribution After Filtering
+
+The following histogram shows the distribution of the `AGEP_A` variable after filtering values to the 18–84 age range. This ensures that only meaningful and valid ages are retained, excluding placeholder codes like 85 (top-coded), 97, 98, and 99.
+
+```{r}
+library(ggplot2)
+
+ggplot(data, aes(x = AGEP_A)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Respondents' Age (AGEP_A)",
+    subtitle = "Filtered between ages 18 and 84",
+    x = "Age",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+### Age-Based Conditional Variables
+
+We identified a group of variables whose availability depends on the respondent's age. Specifically, the following variables are only populated when `AGEP_A` is between **40 and 85 years**:
+
+- `COLOGUARD1_A`: Ever had Cologuard  
+- `FITHEV1_A`: Ever had home blood stool test or FIT  
+- `CTCOLEV1_A`: Ever had a colonography or virtual colonoscopy  
+- `COLORECTEV_A`: Ever had a colonoscopy or sigmoidoscopy  
+- `ASPMEDEV_A`: Told to take low-dose aspirin  
+
+To verify this, we created confusion matrices comparing the presence of `NA` values in each variable with whether the individual's age falls in the 40–85 range.
+
+**Summary of results:**
+- For all variables, individuals < 40 or > 85 always have `NA`.
+- Individuals aged 40–85 always have valid, non-missing responses.
+
+This shows that these variables follow a **conditional skip pattern** in the survey design. Their missingness is **structural**, not random, and should be interpreted accordingly in modeling or imputation strategies.
+
+
+```{r}
+age_vars <- c("COLOGUARD1_A", "FITHEV1_A", "CTCOLEV1_A", "COLORECTEV_A", "ASPMEDEV_A")
+valid_age <- data$AGEP_A >= 40 & data$AGEP_A <= 85
+
+for (var in age_vars) {
+  var_na <- is.na(data[[var]])
+  
+  cm <- table(
+    `Missing in variable` = ifelse(var_na, "NA", "Not NA"),
+    `Age in range 40–85` = ifelse(valid_age, "Yes", "No")
+  )
+  
+  cat(sprintf("\nConfusion matrix for %s:\n", var))
+  print(cm)
+}
+
+```
+```{r}
+cols_to_remove <- c("COLOGUARD1_A", "FITHEV1_A", "CTCOLEV1_A", "COLORECTEV_A", "ASPMEDEV_A")
+data <- data[, !names(data) %in% cols_to_remove]
+new_dims <- dim(data)
+```
+
+
+## Weight Variable (`WEIGHTLBTC_A`)
+
+The variable `WEIGHTLBTC_A` captures weight in pounds, without shoes.
+
+### Cleaning:
+
+1. Convert the variable to numeric.  
+2. Remove values outside the 100–299 lb range.  
+3. Convert from pounds to kilograms using: `kg = lb × 0.453592`
+
+```{r}
+data$WEIGHTLBTC_A <- as.numeric(as.character(data$WEIGHTLBTC_A))
+data <- subset(data, WEIGHTLBTC_A >= 100 & WEIGHTLBTC_A <= 299)
+data$WEIGHTLBTC_A <- data$WEIGHTLBTC_A * 0.453592
+summary(data$WEIGHTLBTC_A)
+```
+
+## Height Variable (`HEIGHTTC_A`)
+
+The variable `HEIGHTTC_A` represents height in inches, without shoes.  
+Valid values range from **59 to 76 inches**.
+
+### Cleaning:
+
+1. Convert the variable to numeric.  
+2. Filter values between 59 and 76 inches.  
+3. Convert to meters using: `m = inch × 0.0254`
+
+```{r}
+data$HEIGHTTC_A <- as.numeric(as.character(data$HEIGHTTC_A))
+data <- subset(data, HEIGHTTC_A >= 59 & HEIGHTTC_A <= 76)
+data$HEIGHTTC_A <- data$HEIGHTTC_A * 0.0254
+summary(data$HEIGHTTC_A)
+```
+
+
+## Poverty Ratio (`POVRATTC_A`)
+The variable `POVRATTC_A` indicates the ratio of a family’s income to the poverty threshold. According to the documentation, all values above 11.00 are **top-coded** and recorded as `11.00`, concealing their true (higher) value.
+
+### Why it matters:
+
+- The value `11.00` is not exact, but rather a lower bound for high-income households.
+- Using `POVRATTC_A` as-is would flatten variability and potentially mislead predictive models.
+
+### Cleaning:
+
+We performed the following steps:
+
+1. Converted `POVRATTC_A` to numeric.
+2. Created a binary indicator `POVRATTC_topcoded`, set to 1 if the value is 11.00 (top-coded), 0 otherwise.
+
+```{r}
+data <- data %>%
+  mutate(
+    POVRATTC_A = as.numeric(as.character(POVRATTC_A)),
+    POVRATTC_topcoded = if_else(POVRATTC_A == 11.00, 1, 0)
+  )
+
+
+data %>%
+  select(POVRATTC_A, POVRATTC_topcoded) %>%
+  head()
+
+
+summary(data$POVRATTC_A)
+table(data$POVRATTC_topcoded)
+prop.table(table(data$POVRATTC_topcoded))
+
+```
+
+### Removing Top-Coded Poverty Ratio Cases
+
+The variable `POVRATTC_A` is top-coded at 11.00, meaning that all values above this threshold are recorded as 11.00. In our dataset, only 4 records were top-coded, accounting for less than 0.02% of the total.
+
+To simplify the analysis and avoid ambiguity due to unknown income levels above 11, we decided to remove these cases:
+
+```{r}
+data$POVRATTC_A <- as.numeric(as.character(data$POVRATTC_A))
+data <- subset(data, POVRATTC_A < 11.00)
+data$POVRATTC_topcoded <-NULL
+```
+
+
+## Mother-Daughter Variable Structure
+
+In structured survey data, some variables are only asked conditionally based on a prior "mother" question. For example:
+
+- If the respondent answers **"1" (Yes)** to the mother question, then the daughter question is asked.
+- Otherwise, the daughter question is skipped, and its value is **NA**.
+
+We verified this structure by checking that daughter variables are only non-missing when the corresponding mother variable equals `"1"`, and missing otherwise.
+
+```{r}
+mother_daughter_matches <- find_strict_mother_daughter(data)
+```
+  
+## Conditional Missingness: Dizziness Module
+
+In this project, we observed that some variables have missing values (`NA`) that are **not missing at random (NMAR)**, but are the direct consequence of **survey logic**.
+
+One example is the variable `BALDIZZ_A`, which asks whether the respondent experienced dizziness or balance problems in the past 12 months.
+
+Only if the respondent answers `"1" (Yes)`, the survey proceeds with the following follow-up questions:
+
+- `BALDHP_A`: Whether the person saw a healthcare provider for the dizziness problem.
+- `BALDPROB_A`: How severe the problem was.
+
+These "daughter variables" are therefore **structurally missing** for all respondents who answered anything other than `"Yes"` to `BALDIZZ_A`.
+
+### Logical Validation
+
+To confirm this, we used confusion matrices to verify that:
+
+- When `BALDIZZ_A == 1`, the daughter variables are filled (not `NA`);
+- In all other cases (`2`, `7`, `8`, `9`), the daughter variables are `NA`.
+
+This validates the **deterministic nature of the missing data** and justifies **not imputing** these values or treating them as random. Instead, we chose to remove these variables from the modeling dataset.
+
+```{r}
+trigger <- "BALDIZZ_A"
+value_filter = c(1)
+
+matched_targets <- find_dependent_targets(data, trigger_var = "BALDIZZ_A", value_filter = value_filter)
+
+if (!is.null(matched_targets)) {
+  for (target in matched_targets) {
+    confusion_value_vs_na(data, trigger_var = "BALDIZZ_A", target_var = target, value_filter = value_filter)
+  }
+}
+```
+
+## Target Variable: DIBEV_A (Ever Had Diabetes)
+
+The variable `DIBEV_A` is our target for prediction. It records whether a respondent has ever been told by a medical professional that they have diabetes (excluding gestational and prediabetes).
+
+**Value breakdown:**
+
+- `1` → Yes (has diabetes)
+- `2` → No
+- `7`, `8`, `9` → Refused / Not Ascertained / Don't Know
+
+We treat `DIBEV_A == 1` as the positive class, and explore other variables that are conditionally asked based on this response.
+
+### Conditional Variables Linked to Diabetes Diagnosis (DIBEV_A)
+
+We analyzed the logical structure of the questionnaire to identify variables that are conditionally shown based on the response to `DIBEV_A`, which asks whether the respondent has ever been diagnosed with diabetes.
+
+Using a custom function, we detected the following daughter variables:
+
+- `DIBAGETC_A`: Age when first diagnosed
+- `DIFYRSTC1_A`: Years since diagnosis
+- `DIBA1CLAST_A`: Last A1C test result
+- `DIBTYPE_A`: Type of diabetes
+- `DIBLAST1_A`: Time since last diabetes care visit
+
+These variables are **only filled in when the respondent answers "Yes" (DIBEV_A == 1)**. In all other cases, they are **structurally missing (NA)**.
+
+### Structural Validation
+
+We validated this using confusion matrices comparing `DIBEV_A` with the NA pattern of each dependent variable:
+
+- All daughter variables are filled only when `DIBEV_A == 1`.
+- All other cases (`2`, `7`, `9`) have missing values as expected.
+
+This confirms that NA values in these variables are **not random**, but the result of **survey logic**, and should not be imputed or treated as unknown.
+
+
+```{r}
+trigger <- "DIBEV_A"
+value_filter = c(1)
+
+matched_targets <- find_dependent_targets(data, trigger_var = "DIBEV_A", value_filter = value_filter)
+
+if (!is.null(matched_targets)) {
+  for (target in matched_targets) {
+    confusion_value_vs_na(data, trigger_var = "DIBEV_A", target_var = target, value_filter = value_filter)
+  }
+}
+```
+
+```{r}
+trigger <- "DIBEV_A"
+value_filter = c(2,7,9)
+
+matched_targets <- find_dependent_targets(data, trigger_var = "DIBEV_A", value_filter = value_filter)
+
+if (!is.null(matched_targets)) {
+  for (target in matched_targets) {
+    confusion_value_vs_na(data, trigger_var = "DIBEV_A", target_var = target, value_filter = value_filter)
+  }
+}
+```
+
+
+The following variables are only asked of respondents who answered "Yes" to the question `DIBEV_A` (diagnosed with diabetes). For all others, these variables are structurally missing (NA) and not applicable.
+
+To avoid introducing noise or bias into our models, we removed them from the dataset:
+
+```{r}
+vars_to_remove <- c(
+  "DIBAGETC_A",    # Age when diagnosed
+  "DIFYRSTC1_A",   # Years since diagnosis
+  "DIBA1CLAST_A",  # Last A1C value
+  "DIBTYPE_A",     # Type of diabetes
+  "DIBLAST1_A",    # Time since last diabetes visit
+  "PREDIB_A",     #Ever had prediabetes 
+  "VIMDREV_A"    #Ever had diabetic retinopathy
+)
+
+data <- data[, !names(data) %in% vars_to_remove]
+```
+
+
+
+## Removing All Columns with Structural Missingness
+
+As demonstrated in previous sections, many `NA` values in the dataset are not random but result from conditional skip patterns in the survey structure. These values reflect questions that were not asked, rather than missing responses.
+
+To avoid bias and ensure consistent input across all records, we removed all columns containing any `NA`. These variables typically depend on prior logic and would not contribute uniformly to predictive modeling.
+
+```{r}
+data <- data[, colSums(is.na(data)) == 0]
+```
+
+
+## Creating the Target Variable: `has_diabetes`
+
+To build a classification model, we created a clean binary target variable based on the NHIS field `DIBEV_A`, which indicates whether the respondent has ever been diagnosed with diabetes (excluding gestational and prediabetes).
+
+We followed these steps:
+
+1. **Filtered the data** to include only respondents who clearly answered `1` (Yes) or `2` (No).
+2. **Mapped values** to a new variable `has_diabetes`:
+   - `1` → `"Yes"`
+   - `2` → `"No"`
+3. **Removed the original variable** `DIBEV_A` to avoid redundancy.
+
+```{r}
+data <- data[data$DIBEV_A %in% c(1, 2), ]
+data$DIBEV_A <- as.integer(as.character(data$DIBEV_A))
+data$has_diabetes <- ifelse(data$DIBEV_A == 1, 1, 0)
+data$DIBEV_A <- NULL
+data$has_diabetes <- factor(data$has_diabetes, levels = c(0, 1), labels = c("No", "Yes"))
+```
+
+
+## Target Variable Distribution
+
+We computed the distribution of the binary target variable `has_diabetes`, which indicates whether the respondent has ever been diagnosed with diabetes:
+
+```{r}
+table(data$has_diabetes)
+prop.table(table(data$has_diabetes))
+```
+
+
+## Handling Special Categorical Response Codes
+
+In many survey-based datasets, non-informative responses are encoded using special numeric values such as `"7"`, `"8"`, `"9"` (e.g., *Refused*, *Don't know*), and `"97"`, `"98"`, `"99"` for extended code ranges.
+
+These values are not missing at random—they carry specific meaning but do not provide valid information for modeling. Therefore, we treated them uniformly by recoding them to a shared `"unknown"` category.
+
+
+```{r}
+valori_speciali <- c("97", "98", "99")
+colonne_speciali <- names(Filter(function(col) {
+  any(valori_speciali %in% as.character(col))
+}, data))
+
+keep_list <- unique(c("SHTFLUM_A", "INTV_MON", "CVDVAC1M1_A", colonne_speciali))
+
+cols_to_replace_789 <- setdiff(names(data), keep_list)
+
+for (col_name in cols_to_replace_789) {
+  if (is.factor(data[[col_name]])) {
+    levels(data[[col_name]]) <- union(levels(data[[col_name]]), "unknown")
+    data[[col_name]][data[[col_name]] %in% c("7", "8", "9")] <- "unknown"
+    data[[col_name]] <- droplevels(data[[col_name]])
+  }
+}
+
+for (col_name in colonne_speciali) {
+  if (is.factor(data[[col_name]])) {
+    levels(data[[col_name]]) <- union(levels(data[[col_name]]), "unknown")
+    data[[col_name]][data[[col_name]] %in% valori_speciali] <- "unknown"
+    data[[col_name]] <- droplevels(data[[col_name]])
+  }
+}
+
+```
+
+## Removing Low-Quality Categorical Variables
+
+To further improve data quality and avoid unreliable predictors, we removed all categorical variables where the proportion of `"unknown"` responses exceeded a given threshold.
+
+These `"unknown"` values result from recoded special response codes (e.g., 7, 8, 9, 97, 98, 99) and typically indicate refusal or uncertainty.
+
+We set a threshold of 10%. Columns where more than 10% of the entries were `"unknown"` were excluded from the dataset.
+
+```{r}
+data <- remove_high_unknown_columns(data, threshold = 0.10, unknown_label = "unknown")
+```
+
+
+## Correlation Analysis
+
+We computed the Pearson correlation matrix to examine the linear relationships between selected numerical variables in the dataset:
+
+- `WEIGHTLBTC_A`: Respondent's weight (in kilograms)
+- `HEIGHTTC_A`: Respondent's height (in meters)
+- `AGEP_A`: Respondent's age
+- `POVRATTC_A`: Poverty income ratio
+
+```{r}
+numeric_vars <- sapply(data, is.numeric)
+cor_matrix <- cor(data[, numeric_vars], use = "complete.obs")
+```
+
+```{r}
+library(reshape2) 
+cor_long <- melt(cor_matrix)
+
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", high = "red", mid = "white",
+    midpoint = 0, limit = c(-1, 1),
+    name = "Correlation"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Correlation Matrix of Numerical Variables",
+    x = "",
+    y = ""
+  ) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+```
+
+
+## Association Analysis Between Categorical Variables
+
+To identify potential redundancy or strong associations between categorical features, we computed **Cramér’s V** for all possible pairs of categorical variables in the dataset.
+
+
+```{r}
+cat_vars <- names(data)[sapply(data, is.factor)]
+comb_list <- combn(cat_vars, 2, simplify = FALSE)
+
+results <- lapply(comb_list, function(pair) {
+  tab <- table(data[[pair[1]]], data[[pair[2]]])
+  if (min(dim(tab)) > 1) {
+    v <- suppressWarnings(CramerV(tab))
+    return(data.frame(var1 = pair[1], var2 = pair[2], cramer_v = v))
+  }
+  return(NULL)
+})
+results_df <- do.call(rbind, results)
+filtered_results <- subset(results_df, cramer_v > 0.7)
+
+```
+
+```{r}
+ggplot(filtered_results, aes(x = var1, y = var2, fill = cramer_v)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "red") +
+  theme_minimal() +
+  labs(
+    title = "Cramér's V > 0.7 among categorical variables",
+    x = "Variable 1",
+    y = "Variable 2",
+    fill = "Cramér's V"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6),
+    axis.text.y = element_text(size = 6),
+    plot.title = element_text(size = 14)
+  )
+
+```
+
+
+### Example: Collinearity Among Ethnicity Variables
+
+The dataset includes multiple variables capturing Hispanic ethnicity:
+
+- `HISP_A`: High-level Hispanic ethnicity recode
+- `HISPALLP_A`: Race/ethnicity combinations with Hispanic origin
+- `HISDETP_A`: Detailed Hispanic origin categories
+
+
+```{r}
+# HISP_A vs HISPALLP_A
+tab1 <- table(data$HISP_A, data$HISPALLP_A)
+chi1 <- chisq.test(tab1)
+print(chi1)
+cat("Cramér's V (HISP_A vs HISPALLP_A):", CramerV(tab1), "\n")
+
+# HISP_A vs HISDETP_A
+tab2 <- table(data$HISP_A, data$HISDETP_A)
+chi2 <- chisq.test(tab2)
+print(chi2)
+cat("Cramér's V (HISP_A vs HISDETP_A):", CramerV(tab2), "\n")
+```
+
+```{r}
+threshold <- 0.7
+highly_correlated <- results_df %>%
+  filter(cramer_v > threshold) %>%
+  arrange(desc(cramer_v))
+
+to_remove <- c()
+used <- c()
+
+for (i in seq_len(nrow(highly_correlated))) {
+  v1 <- highly_correlated$var1[i]
+  v2 <- highly_correlated$var2[i]
+  if (!(v1 %in% used) && !(v2 %in% used)) {
+    to_remove <- c(to_remove, v2)
+    used <- c(used, v2)
+  }
+}
+
+data <- data[, !(names(data) %in% to_remove)]
+
+cat("✅ Removed", length(to_remove), "highly collinear variables:\n")
+print(to_remove)
+```
+
+
+## Handling Perfect Separation in Categorical Predictors
+
+In classification tasks, **perfect separation** occurs when a level of a categorical predictor is associated exclusively with one class of the target variable. This can lead to unstable or non-identifiable models, especially in logistic regression.
+
+To mitigate this issue, we implemented the following strategy:
+
+1. Iterated through all categorical variables (excluding the target).
+2. Built a contingency table between each variable and the target `has_diabetes`.
+3. Identified factor levels that only occur in a single class (either "Yes" or "No").
+4. Removed all rows containing these levels from the dataset.
+5. Dropped the unused levels to ensure clean factor encoding.
+
+This ensures that the dataset does not contain levels that could cause convergence issues or inflated coefficients due to lack of variability across the target.
+
+The following message was printed for each affected variable:
+
+```{r}
+target_var <- "has_diabetes"
+
+for (v in names(data)) {
+  if (v == target_var || !is.factor(data[[v]])) next
+  if (nlevels(data[[v]]) <= 1) next
+
+  tab <- table(data[[v]], data[[target_var]])
+  problematic_levels <- apply(tab, 1, function(x) any(x == 0))
+
+  if (any(problematic_levels)) {
+    levels_to_drop <- names(problematic_levels[problematic_levels])
+    cat(sprintf(" Variable '%s' - removing rows with levels causing perfect separation: %s\n", 
+                v, paste(levels_to_drop, collapse = ", ")))
+    
+    data <- data[!data[[v]] %in% levels_to_drop, ]
+    
+    data[[v]] <- droplevels(data[[v]])
+  }
+}
+
+
+```
+
+```{r}
+summary(data)
+```
+
+```{r}
+dataset_dimensions <- dim(data)
+num_rows <- dataset_dimensions[1]
+num_cols <- dataset_dimensions[2]
+
+na_counts <- colSums(is.na(data))
+num_columns_with_na <- sum(na_counts > 0)
+num_columns_complete <- sum(na_counts == 0)
+
+cat("The dataset contains", num_rows, "rows and", num_cols, "columns.\n")
+cat(num_columns_with_na, "columns contain at least one missing value,\n")
+```
+
+
+##  Exploratory Data Analysis: Numeric Variables by Diabetes Status
+
+We explored the distribution of key numeric predictors stratified by diabetes status (`has_diabetes`). Each histogram shows how the variable is distributed among respondents with and without a prior diagnosis of diabetes.
+
+### Histograms Overview
+
+- **Age (`AGEP_A`)**: This highlights **age as a strong predictive factor**, with increasing prevalence in older adults.
+
+- **Weight (`WEIGHTLBTC_A`)**: Diabetic individuals tend to have **higher body weights**, confirming a known clinical link between body mass and diabetes risk. The distribution is shifted rightward for the "Yes" group.
+
+- **Height (`HEIGHTTC_A`)**: No clear difference is seen in height distribution between groups, suggesting **height may not be an important predictor** in this context.
+
+- **Poverty Ratio (`POVRATTC_A`)**: Diabetic individuals are more represented in the **lower poverty ratio** range, indicating a potential socioeconomic disparity. This may reflect limited access to healthcare or healthy lifestyles among economically disadvantaged groups.
+
+
+```{r}
+small_text_theme <- theme(
+  plot.title = element_text(size = 10),
+  axis.title = element_text(size = 8),
+  axis.text = element_text(size = 7),
+  strip.text = element_text(size = 8)
+)
+
+p1 <- ggplot(data, aes(x = AGEP_A)) +
+  geom_histogram(bins = 40, fill = "skyblue", color = "black") +
+  facet_wrap(~has_diabetes) +
+  ggtitle("Distribuzione dell'età rispetto al diabete") +
+  xlab("Età") + ylab("Frequenza") +
+  small_text_theme
+
+p2 <- ggplot(data, aes(x = WEIGHTLBTC_A)) +
+  geom_histogram(bins = 40, fill = "salmon", color = "black") +
+  facet_wrap(~has_diabetes) +
+  ggtitle("Distribuzione del peso rispetto al diabete") +
+  xlab("Peso (kg)") + ylab("Frequenza") +
+  small_text_theme
+
+p3 <- ggplot(data, aes(x = HEIGHTTC_A)) +
+  geom_histogram(bins = 40, fill = "lightgreen", color = "black") +
+  facet_wrap(~has_diabetes) +
+  ggtitle("Distribuzione dell'altezza rispetto al diabete") +
+  xlab("Altezza (cm)") + ylab("Frequenza") +
+  small_text_theme
+
+p4 <- ggplot(data, aes(x = POVRATTC_A)) +
+  geom_histogram(bins = 40, fill = "orchid", color = "black") +
+  facet_wrap(~has_diabetes) +
+  ggtitle("Distribuzione dell'indice di povertà rispetto al diabete") +
+  xlab("Poverty Ratio") + ylab("Frequenza") +
+  small_text_theme
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+```
+
+## Log Transformation of Numeric Variables
+
+To improve the distributional properties of key numeric variables, we applied a **logarithmic transformation** using `log(x + 1)`. This helps to:
+
+- Reduce skewness
+- Compress extreme values (outliers)
+- Facilitate model assumptions such as normality and homoscedasticity
+
+### Variables Transformed
+
+- `WEIGHTLBTC_A`: Weight in kilograms  
+- `POVRATTC_A`: Poverty ratio (family income relative to the poverty threshold)
+
+We added two new variables to the dataset:
+
+- `WEIGHTLBTC_A_log`
+- `POVRATTC_A_log`
+
+```{r}
+
+data <- data %>%
+  mutate(                      
+    WEIGHTLBTC_A_log = log(WEIGHTLBTC_A + 1),          
+    POVRATTC_A_log = log(POVRATTC_A + 1)               
+  )
+
+summary(data$WEIGHTLBTC_A_log)
+summary(data$POVRATTC_A_log)
+```
+```{r}
+
+make_boxplot_side <- function(data, var_orig, var_transf, label, color) {
+
+  p1 <- ggplot(data, aes(y = .data[[var_orig]])) +
+    geom_boxplot(fill = color) +
+    ggtitle(paste("Boxplot of", label, "- Original")) +
+    theme_minimal()
+  
+  p2 <- ggplot(data, aes(y = .data[[var_transf]])) +
+    geom_boxplot(fill = color) +
+    ggtitle(paste("Boxplot of", label, "- Transformed")) +
+    theme_minimal()
+  
+  grid.arrange(p1, p2, ncol = 2)
+}
+
+make_boxplot_side(data, "WEIGHTLBTC_A", "WEIGHTLBTC_A_log", "Weight", "salmon")
+make_boxplot_side(data, "POVRATTC_A", "POVRATTC_A_log", "Poverty Ratio", "orchid")
+
+```
+
+
+
+# Models
+
+
+
+## Train/Test Split & Factor Level Alignment
+
+```{r}
+train_index <- createDataPartition(data$has_diabetes, p = 0.7, list = FALSE)
+train_data <- data[train_index, ]
+test_data  <- data[-train_index, ]
+
+vars <- names(data)
+
+for (v in vars) {
+  if (is.factor(data[[v]])) {
+    common_levels <- levels(data[[v]])
+    train_data[[v]] <- factor(train_data[[v]], levels = common_levels)
+    test_data[[v]]  <- factor(test_data[[v]],  levels = common_levels)
+  }
+}
+
+
+```
+
+
+
+## Lasso Model
+
+Since the dataset is large and includes many variables, we apply **LASSO** to reduce dimensionality and select the most relevant predictors.
+
+```{r}
+x_train <- model.matrix(has_diabetes ~ . -1, data = train_data)
+x_test  <- model.matrix(has_diabetes ~ . -1, data = test_data)
+
+y_train_lasso <- as.numeric(train_data$has_diabetes) - 1
+y_test_lasso  <- as.numeric(test_data$has_diabetes) - 1
+
+```
+
+```{r}
+cv_lasso <- cv.glmnet(
+  x_train, y_train_lasso,
+  family = "binomial",
+  alpha = 1,            # alpha = 1 = LASSO
+  nfolds = 10           # 10-fold cross-validation
+)
+```
+
+```{r}
+plot(cv_lasso)
+abline(v = log(cv_lasso$lambda.min), col = "green", lty = 2)
+abline(v = log(cv_lasso$lambda.1se), col = "blue", lty = 2)
+```
+
+```{r}
+
+evaluate_lasso_model <- function(pred_probs, y_true, model_name) {
+
+  pred_probs <- as.numeric(pred_probs)
+  
+  roc_curve <- roc(y_true, pred_probs, quiet = TRUE)
+  
+  coords_best <- coords(
+    roc_curve,
+    x = "best",
+    best.method = "youden",
+    ret = c("threshold", "sensitivity", "specificity", "accuracy")
+  )
+  
+  best_thresh <- as.numeric(coords_best["threshold"])
+  sensitivity <- as.numeric(coords_best["sensitivity"])
+  specificity <- as.numeric(coords_best["specificity"])
+  accuracy    <- as.numeric(coords_best["accuracy"])
+  auc_val     <- as.numeric(auc(roc_curve))
+  
+  model_results <- data.frame(
+    Model = model_name,
+    AUC = auc_val,
+    Best.threshold = best_thresh,
+    Accuracy = accuracy,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    stringsAsFactors = FALSE
+  )
+  
+  return(model_results)
+}
+
+```
+
+### Model Comparison
+
+The table below compares the performance of two LASSO models:
+
+- **`LASSO_lambda.min`**: uses the value of `lambda` that minimizes the cross-validation error.
+- **`LASSO_lambda.1se`**: uses the largest value of `lambda` within one standard error of the minimum. This usually leads to a **simpler model** with fewer selected variables.
+
+Choosing the model with `lambda.1se` follows the principle of **parsimony**, which favors simpler models when performance is comparable. Therefore, in the rest of the analysis, we will proceed with **`LASSO_lambda.1se`**.
+
+
+```{r}
+pred_min  <- predict(cv_lasso, newx = x_test, s = cv_lasso$lambda.min,  type = "response")
+pred_1se  <- predict(cv_lasso, newx = x_test, s = cv_lasso$lambda.1se,  type = "response")
+
+res_min  <- evaluate_lasso_model(pred_min,  y_test_lasso, "LASSO_lambda.min")
+res_1se  <- evaluate_lasso_model(pred_1se,  y_test_lasso, "LASSO_lambda.1se")
+
+all_results <- rbind(res_min, res_1se) %>%
+  arrange(desc(AUC))
+
+print(all_results)
+```
+
+
+```{r}
+# --- Confusion Matrix for LASSO_lambda.min ---
+best_thresh_min <- res_min$Best.threshold
+class_min <- factor(ifelse(pred_min > best_thresh_min, "Yes", "No"), levels = c("No", "Yes"))
+actual_class <- factor(ifelse(y_test_lasso == 1, "Yes", "No"), levels = c("No", "Yes"))
+
+conf_matrix_min <- table(Predicted = class_min, Actual = actual_class)
+conf_matrix_min
+```
+
+```{r}
+# --- Confusion Matrix for LASSO_lambda.1se ---
+best_thresh_1se <- res_1se$Best.threshold
+class_1se <- factor(ifelse(pred_1se > best_thresh_1se, "Yes", "No"), levels = c("No", "Yes"))
+
+conf_matrix_1se <- table(Predicted = class_1se, Actual = actual_class)
+conf_matrix_1se
+```
+
+```{r}
+lasso_coefs <- coef(cv_lasso, s = cv_lasso$lambda.1se)
+num_nonzero <- sum(lasso_coefs != 0) - 1
+cat("Number of selected variables:", num_nonzero, "\n")
+
+```
+
+
+### Feature Selection via LASSO
+After applying LASSO regularization, we extracted the set of variables with non-zero coefficients.
+These are the predictors that contribute meaningfully to the model and will be used in the next phase: logistic regression modeling.
+
+```{r}
+lasso_coefs <- coef(cv_lasso, s = cv_lasso$lambda.1se)
+
+coefs_df <- as.data.frame(as.matrix(lasso_coefs))
+coefs_df$variable <- rownames(coefs_df)
+colnames(coefs_df)[1] <- "coefficient"
+
+selected_dummies <- coefs_df$variable[coefs_df$coefficient != 0 & coefs_df$variable != "(Intercept)"]
+
+data_vars <- setdiff(names(data), "has_diabetes")
+
+map_to_variable <- function(dummy, original_vars) {
+  matched <- original_vars[sapply(original_vars, function(var) startsWith(dummy, var))]
+  if (length(matched) > 0) return(matched[1]) else return(NA)
+}
+
+vars <- unique(na.omit(sapply(selected_dummies, map_to_variable, original_vars = data_vars)))
+vars
+```
+
+## Logistic Regression with Cross-Validation
+
+```{r}
+
+cross_validate_model <- function(formula_text, train_data, model_name = "Model_1", target = "has_diabetes", K = 5) {
+  set.seed(123)
+  folds <- createFolds(train_data[[target]], k = K, list = TRUE)
+  formula_obj <- as.formula(formula_text)
+
+  AIC_vals <- BIC_vals <- aucs <- accs <- specs <- senss <- thresholds <- c()
+  vars <- all.vars(formula_obj)[-1]
+
+  for (i in 1:K) {
+    tryCatch({
+      test_idx <- folds[[i]]
+      train_cv <- train_data[-test_idx, ]
+      test_cv  <- train_data[test_idx, ]
+
+      for (v in vars) {
+        if (v %in% names(train_data) && is.factor(train_data[[v]])) {
+          lvls <- levels(train_data[[v]])
+          train_cv[[v]] <- factor(train_cv[[v]], levels = lvls)
+          test_cv[[v]]  <- factor(test_cv[[v]],  levels = lvls)
+    
+          # 🔍 Stampa livelli mancanti se presenti
+          unseen_levels <- setdiff(levels(test_cv[[v]]), lvls)
+          if (length(unseen_levels) > 0) {
+            cat(sprintf(" Fold %d - Variable '%s' has unseen levels in test: %s\n", 
+                        i, v, paste(unseen_levels, collapse = ", ")))
+          }
+        }
+      }
+
+
+      model <- glm(formula_obj, data = train_cv, family = binomial)
+      pred_probs <- predict(model, newdata = test_cv, type = "response")
+
+      roc_curve <- suppressMessages(roc(test_cv[[target]], pred_probs))
+      coords_best <- coords(roc_curve, "best", ret = c("threshold", "sensitivity", "specificity", "accuracy"))
+
+      best_thresh <- as.numeric(coords_best["threshold"])
+      sensitivity <- as.numeric(coords_best["sensitivity"])
+      specificity <- as.numeric(coords_best["specificity"])
+      accuracy <- as.numeric(coords_best["accuracy"])
+
+      AIC_vals <- c(AIC_vals, AIC(model))
+      BIC_vals <- c(BIC_vals, BIC(model))
+      aucs <- c(aucs, as.numeric(auc(roc_curve)))
+      thresholds <- c(thresholds, best_thresh)
+      senss <- c(senss, sensitivity)
+      specs <- c(specs, specificity)
+      accs <- c(accs, accuracy)
+    }, error = function(e) {
+      cat("Error in fold", i, ":", e$message, "\n")
+    })
+  }
+
+  final_model <- glm(formula_obj, data = train_data, family = binomial)
+
+  results <- list(
+    metrics = data.frame(
+      Model = model_name,
+      AIC = mean(AIC_vals, na.rm = TRUE),
+      BIC = mean(BIC_vals, na.rm = TRUE),
+      AUC = mean(aucs, na.rm = TRUE),
+      Best.threshold = mean(thresholds, na.rm = TRUE),
+      Accuracy = mean(accs, na.rm = TRUE),
+      Specificity = mean(specs, na.rm = TRUE),
+      Sensitivity = mean(senss, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    ),
+    model = final_model,
+    best_threshold = mean(thresholds, na.rm = TRUE)
+  )
+
+  return(results)
+}
+
+
+```
+
+```{r}
+evaluate_on_test <- function(model, test_data, threshold, target = "has_diabetes") {
+  vars <- all.vars(formula(model))[-1]
+
+
+  pred_probs <- predict(model, newdata = test_data, type = "response")
+  pred_class <- factor(ifelse(pred_probs > threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+  roc_curve <- suppressMessages(roc(test_data[[target]], pred_probs))
+  auc_val <- as.numeric(auc(roc_curve))
+  cm <- confusionMatrix(pred_class, test_data[[target]], positive = "Yes")
+
+  return(list(
+    AUC = auc_val,
+    Accuracy = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    ConfusionMatrix = cm$table
+  ))
+}
+```
+
+
+In this section, we fit a **logistic regression** model using the variables selected by **LASSO**. These variables were chosen based on their relevance to the target variable `has_diabetes`.
+
+
+```{r}
+
+vars <- c(
+  "HISPALLP_A", "FDSCAT4_A", "BMICAT_A", "EMERG12MTC_A", "AGEP_A",
+  "INCINTER_A", "CEVOLUN1_A", "AVISEXAM_A", "ANXFREQ_A", "EYEEX12M_A",
+  "SHTPNUEV_A", "CHOLLAST_A", "RXDG12M_A", "RX12M_A", "ACCSSINT_A",
+  "DENPREV_A", "SOCSCLPAR_A", "EQUIP_A", "VISIONDF_A", "VIMGLEV_A",
+  "HLTHCOND_A", "CROHNSEV_A", "ANXEV_A", "STREV_A", "MIEV_A",
+  "CHDEV_A", "CHLEV_A", "HYPEV_A", "PHSTAT_A", "WEIGHTLBTC_A", "POVRATTC_A"
+)
+
+formula_text <- paste("has_diabetes ~", paste(vars, collapse = " + "))
+
+cv_results_model_full <- cross_validate_model(formula_text, train_data, model_name = "model_full")
+
+final_test_eval_model_full <- evaluate_on_test(cv_results_model_full$model, test_data, threshold = cv_results_model_full$best_threshold)
+
+print(cv_results_model_full$metrics)
+print(final_test_eval_model_full)
+
+```
+
+
+We now build a second version of the logistic regression model using **log-transformed versions** of selected numerical predictors. In particular, we replace the original `WEIGHTLBTC_A` and `POVRATTC_A` variables with their respective log-transformed counterparts:
+
+- `WEIGHTLBTC_A_log`
+- `POVRATTC_A_log`
+
+The goal is to assess whether this transformation improves model calibration and predictive accuracy, especially in the presence of skewed distributions and outliers.
+
+
+```{r}
+
+vars <- c(
+  "HISPALLP_A", "FDSCAT4_A", "BMICAT_A", "EMERG12MTC_A", "AGEP_A",
+  "INCINTER_A", "CEVOLUN1_A", "AVISEXAM_A", "ANXFREQ_A", "EYEEX12M_A",
+  "SHTPNUEV_A", "CHOLLAST_A", "RXDG12M_A", "RX12M_A", "ACCSSINT_A",
+  "DENPREV_A", "SOCSCLPAR_A", "EQUIP_A", "VISIONDF_A", "VIMGLEV_A",
+  "HLTHCOND_A", "CROHNSEV_A", "ANXEV_A", "STREV_A", "MIEV_A",
+  "CHDEV_A", "CHLEV_A", "HYPEV_A", "PHSTAT_A", "WEIGHTLBTC_A_log", "POVRATTC_A_log"
+)
+
+formula_text <- paste("has_diabetes ~", paste(vars, collapse = " + "))
+
+cv_results <- cross_validate_model(formula_text, train_data, model_name = "model_2")
+model <- glm(formula = formula_text, data = train_data, family = binomial)
+summary(model)
+final_test_eval <- evaluate_on_test(cv_results$model, test_data, threshold = cv_results$best_threshold)
+
+print(cv_results$metrics)
+print(final_test_eval)
+
+```
+
+
+
+After a thorough analysis and multiple modeling iterations, the **best-performing model**—in terms of predictive accuracy and simplicity—is the one using a **reduced set of selected variables**.  
+
+### Why these variables were selected
+
+The selected variables are rooted in both clinical knowledge and socioeconomic context. Below is an explanation of each variable and why it plays an important role in predicting diabetes risk:
+
+- **HISPALLP_A – Hispanic origin and race group**  
+  This variable distinguishes between ethnic groups such as:
+  - Hispanic
+  - Non-Hispanic White
+  - Non-Hispanic Black
+  - Non-Hispanic Asian
+  - American Indian/Alaska Native (AIAN)
+  - Mixed/Other races  
+  Ethnic background is a strong predictor of diabetes risk due to differences in genetics, diet, lifestyle, and access to care. For example, Hispanic and Black populations in the U.S. face significantly higher risks of developing type 2 diabetes.
+
+- **AGEP_A – Age**  
+  Increasing age is directly linked with higher risk of diabetes. With age, insulin sensitivity tends to decline and metabolic function weakens, making older individuals more susceptible.
+
+- **AVISEXAM_A – Time since last eye exam**  
+  This is a proxy for healthcare behavior. The levels include:
+  - Never
+  - Within the past year
+  - 1–2 years ago
+  - 2–3 years ago
+  - 3–5 years ago
+  - 5+ years ago  
+  Frequent eye exams could indicate greater health consciousness or existing complications such as diabetic retinopathy, which is common among diabetic patients.
+
+- **CHDEV_A – Ever diagnosed with coronary heart disease**  
+  Heart disease and diabetes share similar pathophysiological roots, including obesity, inflammation, and hypertension. A previous diagnosis of CHD strongly suggests metabolic stress.
+
+- **CHLEV_A – Ever diagnosed with high cholesterol**  
+  Elevated cholesterol is a core component of metabolic syndrome and often appears before diabetes onset.
+
+- **HYPEV_A – Ever diagnosed with hypertension**  
+  Like cholesterol, hypertension is both a risk factor and a common comorbidity in diabetic patients.
+
+- **PHSTAT_A – General health status**  
+  Self-rated health levels include:
+  - Excellent
+  - Very good
+  - Good
+  - Fair
+  - Poor  
+  Subjective health evaluations often reflect the presence of chronic conditions. Those reporting "fair" or "poor" health are significantly more likely to have underlying illnesses, including diabetes.
+
+- **WEIGHTLBTC_A_log – Log-transformed weight**  
+  Obesity is one of the strongest predictors of diabetes. Log transformation helps reduce skewness and normalize the distribution for regression modeling.
+
+- **POVRATTC_A_log – Log-transformed poverty ratio**  
+  Poverty impacts access to quality food, healthcare, and education. Lower income is strongly linked with higher prevalence and poorer management of diabetes. Log transformation again helps reduce skewness in the variable.
+
+Together, these variables offer a meaningful and interpretable structure to capture both the biological and socioeconomic dimensions influencing diabetes risk.
+
+
+```{r}
+
+vars <- c(
+  "HISPALLP_A", "AGEP_A", "AVISEXAM_A", "CHDEV_A", "CHLEV_A", "HYPEV_A", "PHSTAT_A", "WEIGHTLBTC_A_log", "POVRATTC_A_log"
+)
+
+
+formula_text <- paste("has_diabetes ~ ", paste(vars, collapse = " + "))
+
+cv_results <- cross_validate_model(formula_text, train_data, model_name = "Logistic")
+model <- glm(formula = formula_text, data = train_data, family = binomial)
+summary(model)
+final_test_eval <- evaluate_on_test(cv_results$model, test_data, threshold = cv_results$best_threshold)
+
+print(cv_results$metrics)
+print(final_test_eval)
+
+```
+
+### Interpretation of Logistic Regression Coefficients
+
+The logistic regression output provides insights into how each variable affects the likelihood of being diagnosed with diabetes. Here's a summary of the key findings:
+
+#### Intercept
+- **(Intercept): -12.13**  
+  This is the baseline log-odds of diabetes when all predictors are at zero. It’s not directly interpretable on its own but is used as a reference.
+
+---
+
+#### Demographics
+
+- **AGEP_A: +0.024**  
+  Each additional year of age increases the log-odds of having diabetes. Older individuals are more at risk.
+
+- **HISPALLP_A**
+  - **HISPALLP_A2 (Non-Hispanic White): -0.43**  
+    Lower risk compared to the reference group (Hispanic).
+  - **HISPALLP_A4 (Non-Hispanic Asian): +0.39**  
+    Slightly increased risk compared to Hispanics.
+  - **HISPALLP_A6 (Non-Hispanic AIAN + other): -0.77**  
+    Significantly decreased risk, though based on a smaller group.
+  - Other groups were not significant.
+
+---
+
+#### Health Behavior and History
+
+- **AVISEXAM_A (Time since last eye exam)**  
+  (Reference: never had an exam)
+  - **AVISEXAM_A1 (within the past year): +1.23**  
+    Strongly associated with higher diabetes probability – may reflect diagnosis and follow-up.
+  - **AVISEXAM_A2/3/4 (1–5 years ago): +0.30 to +0.72**  
+    Still positively associated but less strongly.
+  - **AVISEXAM_A5 (5+ years): -0.16**  
+    Negative, possibly due to lack of health monitoring.
+  - **Unknown: +0.60**  
+    Surprisingly positive, potentially reflecting uncertainty in healthcare access.
+
+- **CHDEV_A2 (No CHD): -0.40**  
+  People who report no coronary heart disease have significantly lower diabetes risk (logical link between metabolic diseases).
+
+- **CHLEV_A2 (No high cholesterol): -0.79**  
+  Again, absence of this condition is associated with reduced diabetes risk.
+
+- **HYPEV_A2 (No hypertension): -0.76**  
+  Strong negative predictor—hypertension and diabetes often co-occur.
+
+---
+
+#### Subjective Health Status
+
+- **PHSTAT_A (General health, reference: Excellent)**  
+  Higher values (worse self-perceived health) are associated with increased diabetes risk:
+  - **Very Good: +0.77**
+  - **Good: +1.49**
+  - **Fair: +2.00**
+  - **Poor: +2.31**
+  - **Unknown: +2.65**
+
+  There’s a clear dose-response trend: the worse the self-rated health, the more likely the person has diabetes.
+
+---
+
+#### Anthropometric and Socioeconomic Factors
+
+- **WEIGHTLBTC_A_log: +1.90**  
+  Strong positive predictor. Higher (log-transformed) weight greatly increases diabetes risk. This aligns with well-established links between obesity and diabetes.
+
+- **POVRATTC_A_log: -0.38**  
+  A higher poverty ratio (i.e., being above the poverty line) **reduces** the probability of diabetes. Poverty is a known risk factor due to barriers in accessing healthy food and healthcare.
+
+---
+
+### Summary
+- **Positive coefficients** (e.g., poor health, recent eye exam, age, weight) indicate higher risk of diabetes.
+- **Negative coefficients** (e.g., no hypertension/cholesterol, higher income) indicate protective factors.
+- The most influential predictors are **self-rated health**, **weight**, and **access to healthcare** (eye exams, diagnosis history).
+
+
+
+## LDA
+
+```{r}
+
+cross_validate_lda <- function(formula_text, train_data, model_name = "LDA_Model", target = "has_diabetes", K = 5) {
+  set.seed(123)
+  folds <- createFolds(train_data[[target]], k = K, list = TRUE)
+  formula_obj <- as.formula(formula_text)
+
+  aucs <- accs <- specs <- senss <- thresholds <- c()
+  vars <- all.vars(formula_obj)[-1]
+
+  for (i in 1:K) {
+    tryCatch({
+      test_idx <- folds[[i]]
+      train_cv <- train_data[-test_idx, ]
+      test_cv  <- train_data[test_idx, ]
+
+      for (v in vars) {
+        if (v %in% names(train_data) && is.factor(train_data[[v]])) {
+          lvls <- levels(train_data[[v]])
+          train_cv[[v]] <- factor(train_cv[[v]], levels = lvls)
+          test_cv[[v]]  <- factor(test_cv[[v]],  levels = lvls)
+        }
+      }
+
+      model <- lda(formula_obj, data = train_cv)
+      pred_probs <- predict(model, newdata = test_cv)$posterior[, "Yes"]
+
+      roc_curve <- suppressMessages(roc(test_cv[[target]], pred_probs))
+      coords_best <- coords(roc_curve, "best", ret = c("threshold", "sensitivity", "specificity", "accuracy"))
+
+      best_thresh <- as.numeric(coords_best["threshold"])
+      sensitivity <- as.numeric(coords_best["sensitivity"])
+      specificity <- as.numeric(coords_best["specificity"])
+      accuracy <- as.numeric(coords_best["accuracy"])
+
+      aucs <- c(aucs, as.numeric(auc(roc_curve)))
+      thresholds <- c(thresholds, best_thresh)
+      senss <- c(senss, sensitivity)
+      specs <- c(specs, specificity)
+      accs <- c(accs, accuracy)
+    }, error = function(e) {
+      cat("Error in fold", i, ":", e$message, "\n")
+    })
+  }
+
+  final_model <- lda(formula_obj, data = train_data)
+
+  results <- list(
+    metrics = data.frame(
+      Model = model_name,
+      AUC = mean(aucs, na.rm = TRUE),
+      Best.threshold = mean(thresholds, na.rm = TRUE),
+      Accuracy = mean(accs, na.rm = TRUE),
+      Specificity = mean(specs, na.rm = TRUE),
+      Sensitivity = mean(senss, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    ),
+    model = final_model,
+    best_threshold = mean(thresholds, na.rm = TRUE)
+  )
+
+  return(results)
+}
+
+```
+
+```{r}
+evaluate_on_test_lda <- function(model, test_data, threshold, target = "has_diabetes") {
+  vars <- all.vars(model$call)[-1]
+  
+  pred_probs <- predict(model, newdata = test_data)$posterior[, "Yes"]
+  pred_class <- factor(ifelse(pred_probs > threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+  roc_curve <- suppressMessages(roc(test_data[[target]], pred_probs))
+  auc_val <- as.numeric(auc(roc_curve))
+  cm <- confusionMatrix(pred_class, test_data[[target]], positive = "Yes")
+
+  return(list(
+    AUC = auc_val,
+    Accuracy = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    ConfusionMatrix = cm$table
+  ))
+}
+
+```
+
+```{r}
+formula_text_lda <- paste("has_diabetes ~", paste(vars, collapse = " + "))
+
+formula_text <- paste("has_diabetes ~", paste(vars, collapse = " + "))
+
+cv_results_lda <- cross_validate_lda(formula_text, train_data, model_name = "LDA")
+final_test_eval_lda <- evaluate_on_test_lda(cv_results_lda$model, test_data, threshold = cv_results_lda$best_threshold)
+
+print(cv_results_lda$metrics)
+print(final_test_eval_lda)
+
+```
+
+## Naive Bayes
+
+```{r}
+cross_validate_nb <- function(formula_text, train_data, model_name = "NaiveBayes_Model", target = "has_diabetes", K = 5) {
+  set.seed(123)
+  folds <- createFolds(train_data[[target]], k = K, list = TRUE)
+  formula_obj <- as.formula(formula_text)
+
+  aucs <- accs <- specs <- senss <- thresholds <- c()
+  vars <- all.vars(formula_obj)[-1]
+
+  for (i in 1:K) {
+    tryCatch({
+      test_idx <- folds[[i]]
+      train_cv <- train_data[-test_idx, ]
+      test_cv  <- train_data[test_idx, ]
+
+      for (v in vars) {
+        if (v %in% names(train_data) && is.factor(train_data[[v]])) {
+          lvls <- levels(train_data[[v]])
+          train_cv[[v]] <- factor(train_cv[[v]], levels = lvls)
+          test_cv[[v]]  <- factor(test_cv[[v]],  levels = lvls)
+        }
+      }
+
+      model <- naiveBayes(formula_obj, data = train_cv)
+      pred_probs <- predict(model, newdata = test_cv, type = "raw")[, "Yes"]
+
+      roc_curve <- suppressMessages(roc(test_cv[[target]], pred_probs))
+      coords_best <- coords(roc_curve, "best", ret = c("threshold", "sensitivity", "specificity", "accuracy"))
+
+      best_thresh <- as.numeric(coords_best["threshold"])
+      sensitivity <- as.numeric(coords_best["sensitivity"])
+      specificity <- as.numeric(coords_best["specificity"])
+      accuracy <- as.numeric(coords_best["accuracy"])
+
+      aucs <- c(aucs, as.numeric(auc(roc_curve)))
+      thresholds <- c(thresholds, best_thresh)
+      senss <- c(senss, sensitivity)
+      specs <- c(specs, specificity)
+      accs <- c(accs, accuracy)
+    }, error = function(e) {
+      cat("Error in fold", i, ":", e$message, "\n")
+    })
+  }
+
+  final_model <- naiveBayes(formula_obj, data = train_data)
+
+  results <- list(
+    metrics = data.frame(
+      Model = model_name,
+      AUC = mean(aucs, na.rm = TRUE),
+      Best.threshold = mean(thresholds, na.rm = TRUE),
+      Accuracy = mean(accs, na.rm = TRUE),
+      Specificity = mean(specs, na.rm = TRUE),
+      Sensitivity = mean(senss, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    ),
+    model = final_model,
+    best_threshold = mean(thresholds, na.rm = TRUE)
+  )
+
+  return(results)
+}
+```
+
+```{r}
+evaluate_on_test_nb <- function(model, test_data, threshold, target = "has_diabetes") {
+  library(pROC)
+  library(caret)
+
+  pred_probs <- predict(model, newdata = test_data, type = "raw")[, "Yes"]
+  pred_class <- factor(ifelse(pred_probs > threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+  roc_curve <- suppressMessages(roc(test_data[[target]], pred_probs))
+  auc_val <- as.numeric(auc(roc_curve))
+  cm <- confusionMatrix(pred_class, test_data[[target]], positive = "Yes")
+
+  return(list(
+    AUC = auc_val,
+    Accuracy = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    ConfusionMatrix = cm$table
+  ))
+}
+
+```
+
+```{r}
+formula_text_nb <- paste("has_diabetes ~", paste(vars, collapse = " + "))
+
+cv_results_nb <- cross_validate_nb(formula_text_nb, train_data, model_name = "NaiveBayes")
+final_test_eval_nb <- evaluate_on_test_nb(cv_results_nb$model, test_data, threshold = cv_results_nb$best_threshold)
+
+print(cv_results_nb$metrics)
+print(final_test_eval_nb)
+
+```
+
+## KNN
+
+```{r}
+cross_validate_knn <- function(formula_text, train_data, model_name = "KNN_Model", target = "has_diabetes", K = 5, k_neighbors = 5) {
+  set.seed(123)
+  folds <- createFolds(train_data[[target]], k = K, list = TRUE)
+  formula_obj <- as.formula(formula_text)
+  vars <- all.vars(formula_obj)[-1]
+
+  aucs <- c()
+  accs <- c()
+  specs <- c()
+  senss <- c()
+  thresholds <- c()
+
+  for (i in 1:K) {
+    tryCatch({
+      test_idx <- folds[[i]]
+      train_cv <- train_data[-test_idx, ]
+      test_cv  <- train_data[test_idx, ]
+
+      train_X <- train_cv[, vars]
+      test_X  <- test_cv[, vars]
+      train_Y <- train_cv[[target]]
+      test_Y  <- test_cv[[target]]
+
+      train_X <- as.data.frame(lapply(train_X, as.numeric))
+      test_X  <- as.data.frame(lapply(test_X, as.numeric))
+
+      pred_class <- knn(train = train_X, test = test_X, cl = train_Y, k = k_neighbors, prob = TRUE)
+      pred_probs <- ifelse(attr(pred_class, "prob") >= 0.5, attr(pred_class, "prob"), 1 - attr(pred_class, "prob"))
+
+      roc_curve <- suppressMessages(roc(test_Y, pred_probs))
+      coords_best <- coords(roc_curve, "best", ret = c("threshold", "sensitivity", "specificity", "accuracy"), transpose = FALSE)
+
+      aucs <- c(aucs, as.numeric(auc(roc_curve)))
+      thresholds <- c(thresholds, as.numeric(coords_best[["threshold"]]))
+      senss <- c(senss, as.numeric(coords_best[["sensitivity"]]))
+      specs <- c(specs, as.numeric(coords_best[["specificity"]]))
+      accs <- c(accs, as.numeric(coords_best[["accuracy"]]))
+    }, error = function(e) {
+      cat("Error in fold", i, ":", e$message, "\n")
+    })
+  }
+
+  results <- list(
+    metrics = data.frame(
+      Model = model_name,
+      AUC = mean(aucs, na.rm = TRUE),
+      Best.threshold = mean(thresholds, na.rm = TRUE),
+      Accuracy = mean(accs, na.rm = TRUE),
+      Specificity = mean(specs, na.rm = TRUE),
+      Sensitivity = mean(senss, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    ),
+    best_threshold = mean(thresholds, na.rm = TRUE),
+    k = k_neighbors
+  )
+
+  return(results)
+}
+
+
+```
+
+```{r}
+evaluate_on_test_knn <- function(train_data, test_data, formula_text, threshold, k = 5, target = "has_diabetes") {
+  formula_obj <- as.formula(formula_text)
+  vars <- all.vars(formula_obj)[-1]
+
+  train_X <- as.data.frame(lapply(train_data[, vars], as.numeric))
+  test_X  <- as.data.frame(lapply(test_data[, vars], as.numeric))
+  train_Y <- factor(train_data[[target]], levels = c("No", "Yes"))
+  test_Y  <- factor(test_data[[target]], levels = c("No", "Yes"))
+
+  pred_class <- knn(train = train_X, test = test_X, cl = train_Y, k = k, prob = TRUE)
+
+  pred_probs <- ifelse(pred_class == "Yes", attr(pred_class, "prob"), 1 - attr(pred_class, "prob"))
+  pred_final <- factor(ifelse(pred_probs >= threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+  roc_curve <- suppressMessages(roc(test_Y, pred_probs, levels = c("No", "Yes"), direction = "<"))
+  auc_val <- as.numeric(auc(roc_curve))
+  cm <- confusionMatrix(pred_final, test_Y, positive = "Yes")
+
+  return(list(
+    AUC = auc_val,
+    Accuracy = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    ConfusionMatrix = cm$table
+  ))
+}
+
+
+```
+
+```{r}
+formula_text_knn <- paste("has_diabetes ~", paste(vars, collapse = " + "))
+
+tuning_results <- lapply(1:20, function(k) {
+  res <- cross_validate_knn(
+    formula_text = formula_text_knn,
+    train_data = train_data,
+    model_name = paste0("KNN_k", k),
+    k_neighbors = k
+  )
+  metrics <- res$metrics
+  metrics$k <- k
+  return(metrics)
+})
+
+tuning_metrics_df <- do.call(rbind, tuning_results)
+
+print(tuning_metrics_df)
+
+best_k_auc <- tuning_metrics_df$k[which.max(tuning_metrics_df$AUC)]
+best_k_acc <- tuning_metrics_df$k[which.max(tuning_metrics_df$Accuracy)]
+
+cat("Best k by AUC:", best_k_auc, "\n")
+cat("Best k by Accuracy:", best_k_acc, "\n")
+```
+```{r}
+ggplot(tuning_metrics_df, aes(x = k)) +
+  geom_line(aes(y = Accuracy), color = "blue", linewidth = 1) +
+  geom_line(aes(y = AUC), color = "red", linewidth = 1, linetype = "dashed") +
+  labs(title = "KNN Cross-Validation Performance",
+       x = "Number of Neighbors (k)",
+       y = "Metric Value",
+       caption = "Blue = Accuracy, Red = AUC") +
+  theme_minimal()
+```
+
+```{r}
+valid_metrics <- na.omit(tuning_metrics_df)
+
+best_k <- valid_metrics$k[which.max(valid_metrics$AUC)]
+cat("Miglior k selezionato:", best_k, "\n")
+
+cv_results_knn <- cross_validate_knn(
+  formula_text = formula_text_knn,
+  train_data = train_data,
+  model_name = paste0("KNN_best_k", best_k),
+  k_neighbors = best_k
+)
+
+final_test_eval_knn <- evaluate_on_test_knn(
+  train_data = train_data,
+  test_data = test_data,
+  formula_text = formula_text_knn,
+  threshold = cv_results_knn$best_threshold,
+  k = best_k
+)
+
+print(cv_results_knn$metrics)
+print(final_test_eval_knn)
+
+```
+
+## Model Comparison: Logistic Regression vs. LDA, Naive Bayes, and KNN
+
+We evaluated four classification models trained on the same 24 predictors to assess their performance in predicting diabetes. Below is a summary of their evaluation metrics:
+
+```{r}
+logistic_metrics <- cv_results$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+lda_metrics      <- cv_results_lda$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+nb_metrics       <- cv_results_nb$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+knn_metrics       <- cv_results_knn$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+
+comparison_df <- rbind(logistic_metrics, lda_metrics, nb_metrics, knn_metrics)
+
+print(comparison_df)
+
+cat("\n--- Confusion Matrix: Logistic Regression ---\n")
+print(final_test_eval$ConfusionMatrix)
+
+cat("\n--- Confusion Matrix: LDA ---\n")
+print(final_test_eval_lda$ConfusionMatrix)
+
+cat("\n--- Confusion Matrix: Naive Bayes ---\n")
+print(final_test_eval_nb$ConfusionMatrix)
+
+cat("\n--- Confusion Matrix: KNN ---\n")
+print(final_test_eval_knn$ConfusionMatrix)
+```
+
+
+- **Logistic Regression**: Highest **AUC ** and **accuracy** among all models.Good balance between sensitivity and specificity.Best choice if interpretability and overall performance are prioritized.
+
+- **Naive Bayes**: Achieves the **highest sensitivity**, meaning it captures more true positives.
+
+- **K-Nearest Neighbors (KNN)**: Lowest performance across all metrics. Likely suffers due to high dimensionality and lack of tuning.
+
+
+
+## Ridge Regression
+
+
+```{r}
+x_train <- model.matrix(has_diabetes ~ . -1, data = train_data)
+x_test  <- model.matrix(has_diabetes ~ . -1, data = test_data)
+
+y_train_ridge <- as.numeric(train_data$has_diabetes) - 1
+y_test_ridge  <- as.numeric(test_data$has_diabetes) - 1
+
+```
+
+```{r}
+cv_ridge <- cv.glmnet(
+  x_train, y_train_ridge,
+  family = "binomial",
+  alpha = 0,           # alpha = 0 = Ridge
+  nfolds = 10
+)
+
+
+```
+
+```{r}
+plot(cv_ridge)
+abline(v = log(cv_ridge$lambda.min), col = "green", lty = 2)
+abline(v = log(cv_ridge$lambda.1se), col = "blue", lty = 2)
+
+
+```
+
+```{r}
+pred_ridge_min  <- predict(cv_ridge, newx = x_test, s = cv_ridge$lambda.min, type = "response")
+pred_ridge_1se  <- predict(cv_ridge, newx = x_test, s = cv_ridge$lambda.1se, type = "response")
+
+res_ridge_min  <- evaluate_lasso_model(pred_ridge_min,  y_test_ridge, "Ridge_lambda.min")
+res_ridge_1se  <- evaluate_lasso_model(pred_ridge_1se,  y_test_ridge, "Ridge_lambda.1se")
+
+ridge_results <- rbind(res_ridge_min, res_ridge_1se) %>%
+  arrange(desc(AUC))
+
+print(ridge_results)
+
+```
+
+```{r}
+# Per Ridge lambda.min
+best_thresh_ridge_min <- res_ridge_min$Best.threshold
+class_ridge_min <- factor(ifelse(pred_ridge_min > best_thresh_ridge_min, "Yes", "No"), levels = c("No", "Yes"))
+actual_class_ridge <- factor(ifelse(y_test_ridge == 1, "Yes", "No"), levels = c("No", "Yes"))
+conf_matrix_ridge_min <- table(Predicted = class_ridge_min, Actual = actual_class_ridge)
+conf_matrix_ridge_min
+```
+
+```{r}
+# Per Ridge lambda.1se
+best_thresh_ridge_1se <- res_ridge_1se$Best.threshold
+class_ridge_1se <- factor(ifelse(pred_ridge_1se > best_thresh_ridge_1se, "Yes", "No"), levels = c("No", "Yes"))
+conf_matrix_ridge_1se <- table(Predicted = class_ridge_1se, Actual = actual_class_ridge)
+conf_matrix_ridge_1se
+
+```
+
+```{r}
+ridge_coefs <- coef(cv_ridge, s = cv_ridge$lambda.1se)
+num_nonzero_ridge <- sum(ridge_coefs != 0) - 1
+cat("Number of non-zero coefficients in Ridge (lambda.1se):", num_nonzero_ridge, "\n")
+```
+
+
+
+# Final Model Comparison & Conclusion
+
+The table below summarizes the performance of all evaluated models on the diabetes classification task, ranked by AUC (Area Under the Curve):
+```{r}
+lasso_metrics <- rbind(res_min, res_1se)
+
+ridge_metrics <- rbind(res_ridge_min, res_ridge_1se)
+logistic_metrics_full <- cv_results_model_full$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+logistic_metrics <- cv_results$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+lda_metrics      <- cv_results_lda$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+nb_metrics       <- cv_results_nb$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+knn_metrics      <- cv_results_knn$metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+
+all_model_metrics <- rbind(
+  logistic_metrics_full,
+  logistic_metrics,
+  lda_metrics,
+  nb_metrics,
+  knn_metrics,
+  lasso_metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")],
+  ridge_metrics[, c("Model", "AUC", "Accuracy", "Sensitivity", "Specificity")]
+)
+
+all_model_metrics <- all_model_metrics[order(-all_model_metrics$AUC), ]
+
+print(all_model_metrics)
+```
+GLM (Reduced) is the most balanced model, combining simplicity, interpretability, and solid performance across all metrics.
+LASSO models achieve comparable sensitivity and AUC to GLM, with the advantage of feature selection that improves model interpretability.
+Ridge performs very similarly to LASSO, slightly favoring stability over sparsity.
+Naive Bayes and LDA are competitive alternatives but slightly inferior in terms of AUC and specificity.
+KNN underperforms across all metrics, confirming its weakness in this high-dimensional, imbalanced classification task.
+
