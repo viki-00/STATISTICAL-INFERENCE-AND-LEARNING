@@ -1,15 +1,15 @@
-# 🩺 SIL Project – Diabetes Prediction
+# SIL Project – Diabetes Prediction
 
 **Author:** Victoria Grosu  
 **Date:** May 2025  
 
-## 📘 Overview
+## Overview
 This project develops a **machine learning pipeline** to predict whether an adult has been diagnosed with diabetes using data from the **2023 National Health Interview Survey (NHIS)**.  
 It integrates **statistical modeling**, **regularization techniques**, and **comparative evaluation** of classifiers to ensure both **high predictive performance** and **interpretability**.
 
 ---
 
-## 🧩 Dataset
+## Dataset
 - **Source:** [National Health Interview Survey 2023 (NHIS)](https://www.cdc.gov/nchs/nhis/documentation/2023-nhis.html)  
 - **Initial size:** 29,522 rows × 647 columns  
 - **Final cleaned dataset:** 23,826 adults × 128 variables (no missing values)
@@ -26,13 +26,13 @@ It integrates **statistical modeling**, **regularization techniques**, and **com
 
 ---
 
-## 🔍 Exploratory Data Analysis
+## Exploratory Data Analysis
 - Explored **age**, **weight**, **height**, and **poverty ratio** distributions by diabetes status.  
 - Applied **log-transformation** to reduce skewness in weight and poverty ratio, improving model robustness.
 
 ---
 
-## 🧠 Modeling Pipeline
+## Modeling Pipeline
 The study evaluates several **regularized and classical classification methods**.
 
 ### 1. **LASSO Regression**
@@ -63,7 +63,7 @@ Three logistic models were tested:
 
 ---
 
-## ⚖️ Model Comparison
+## Model Comparison
 
 | Model | AUC | Accuracy | Sensitivity | Specificity |
 |-------|------|-----------|--------------|--------------|
@@ -73,26 +73,12 @@ Three logistic models were tested:
 | KNN (k=20) | 0.81 | 0.70 | 0.80 | 0.69 |
 | Ridge Regression | 0.86 | 0.75 | 0.86 | 0.73 |
 
-➡️ **Conclusion:** Logistic Regression provides the best trade-off between accuracy and interpretability, confirming its suitability for clinical diagnostic applications.
+ **Conclusion:** Logistic Regression provides the best trade-off between accuracy and interpretability, confirming its suitability for clinical diagnostic applications.
 
 ---
 
-## ⚙️ Technologies Used
+## Technologies Used
 - **R** (tidyverse, glmnet, MASS, caret)
 - **Python** (optional, for visualization or automation)
 - **Statistical methods:** LASSO, Ridge, GLM, LDA, Naive Bayes, KNN
-
----
-
-## 🚀 Future Work
-- Extend dataset with lifestyle and dietary variables  
-- Integrate feature engineering (BMI, cholesterol ratio, etc.)  
-- Deploy predictive model as an **interactive dashboard or API**  
-
----
-
-## 📄 License
-This project is intended for **educational and research purposes only**.  
-Data © [CDC – NHIS 2023](https://www.cdc.gov/nchs/nhis/documentation/2023-nhis.html).
-
 ---
